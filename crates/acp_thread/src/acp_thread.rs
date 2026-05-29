@@ -2321,10 +2321,10 @@ impl AcpThread {
             self.project.read(cx).path_style(cx),
             cx,
         );
-        let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
-        let git_store = self.project.read(cx).git_store().clone();
-
         let message_id = UserMessageId::new();
+        let request = acp::PromptRequest::new(self.session_id.clone(), message.clone())
+            .message_id(message_id.to_string());
+        let git_store = self.project.read(cx).git_store().clone();
 
         self.run_turn(cx, async move |this, cx| {
             this.update(cx, |this, cx| {
@@ -5451,6 +5451,50 @@ mod tests {
                 "user message should always have an id"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_send_populates_message_id_on_prompt_request(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let captured: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let captured = captured.clone();
+            move |params, _thread, _cx| {
+                *captured.borrow_mut() = params.message_id;
+                async move { Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)) }
+                    .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("hello", cx))
+            .await
+            .unwrap();
+
+        let stored_id = thread.read_with(cx, |thread, _| {
+            let AgentThreadEntry::UserMessage(message) = &thread.entries[0] else {
+                panic!("expected first entry to be a user message")
+            };
+            message.id.clone().expect("user message should have an id")
+        });
+
+        let sent = captured.borrow().clone();
+        assert_eq!(
+            sent.as_deref(),
+            Some(stored_id.to_string().as_str()),
+            "prompt request should carry the same message_id stored on the entry"
+        );
     }
 
     #[gpui::test]
