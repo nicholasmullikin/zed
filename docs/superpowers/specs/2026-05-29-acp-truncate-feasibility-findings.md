@@ -2,75 +2,74 @@
 
 **Date:** 2026-05-29
 **Spike for:** [2026-05-29-acp-edit-sent-messages-design.md](./2026-05-29-acp-edit-sent-messages-design.md), Task 1 of [the plan](../plans/2026-05-29-acp-edit-sent-messages.md)
-**Method:** Inspected the live ACP registry and a shallow clone of the Claude adapter source (`github.com/agentclientprotocol/claude-agent-acp`).
+**Method:** Inspected the live ACP registry, a shallow clone of the Claude adapter source (`github.com/agentclientprotocol/claude-agent-acp@0.39.0`), and the published `@anthropic-ai/claude-agent-sdk@0.3.156` type definitions (`sdk.d.ts`).
+
+> **Correction (revised after deeper review):** An earlier version of this note concluded the Claude Agent SDK had "no rewind primitive." **That was wrong** — it was based only on the functions the *adapter imports*, not the full SDK API. Inspecting the SDK's own `sdk.d.ts` shows native, documented rewind primitives. The corrected conclusion is below.
 
 ## TL;DR
 
-**Recommendation: GO on the dedicated `session/truncate` protocol verb (Plan A), but Plan B (adapter) is the real risk and is partially blocked on the Claude Agent SDK.**
+**Recommendation: GO. A native rewind mechanism exists in the Claude Agent SDK. Plan B (adapter) is feasible without any new Anthropic primitive — it is "expose an existing SDK capability over ACP."**
 
-- The adapter does **not** echo `message_id` today, and it does **not** correlate the ACP `message_id` with anything. Task 2 (thread `message_id` from Zed) is necessary but **not sufficient** — the adapter must additionally record an `acpMessageId → SDK message uuid` mapping.
-- The underlying `@anthropic-ai/claude-agent-sdk` exposes **no rewind/truncate/edit/checkpoint API**. Its only session-control primitives are `resume` (continue full session), `forkSession` (branch the *whole* session), and `deleteSession` (drop the whole session). Reads are via `getSessionMessages` / `listSessions`.
-- Therefore a clean "forget everything after message N" is **not achievable with the current SDK surface**. It requires either (a) a new rewind primitive in `@anthropic-ai/claude-agent-sdk`, or (b) a supported "trim the on-disk transcript, then resume" path. Both need Anthropic/Claude-Agent-SDK involvement. This should be confirmed with the SDK owners before committing to Plan B.
-- Additional complication: the SDK performs **automatic context compaction** mid-turn (the adapter tracks `compactionInProgress`). Once a conversation has been compacted, a precise message-boundary truncation is harder still, because earlier turns may no longer exist as discrete, replayable messages.
+- The SDK provides **`resumeSessionAt`** (a `query` option: resume a session truncated to a message UUID, same session id) and **`forkSession(sessionId, { upToMessageId })`** (slice the transcript up to a message UUID into a new session). Either can implement "forget everything after message N."
+- It also provides **`rewindFiles(userMessageId)`** (with `enableFileCheckpointing`) — a native restore of tracked files to their state at a user message, a built-in analogue of Zed's git checkpoint.
+- The adapter does **not** surface any of these today, and it does **not** echo or map the ACP `message_id`. So the remaining work is real but bounded: thread `message_id` (Task 2, done), have the adapter record an `acpMessageId → SDK transcript uuid` mapping, and add a `session/truncate` handler that calls `resumeSessionAt` (or `forkSession({upToMessageId})`).
+- One genuine caveat to validate, not assume: the SDK auto-compacts context mid-turn (the adapter tracks `compactionInProgress`). Rewinding across a compaction boundary needs testing, but since these rewind features are first-class SDK features (Claude Code's interactive rewind uses them), the SDK most likely handles it.
 
 ## Step 1 — Exact adapter Zed launches
 
 - Agent id: `claude-acp` (`crates/agent_servers/src/custom.rs:18`, `CLAUDE_AGENT_ID`).
 - Registry: `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json` (`crates/project/src/agent_registry_store.rs:20`).
-- Live registry entry for `claude-acp`:
-  - name: "Claude Agent", version `0.39.0`
-  - npx package: `@agentclientprotocol/claude-agent-acp@0.39.0`
-  - repository: `https://github.com/agentclientprotocol/claude-agent-acp`
-  - authors: Anthropic, Zed Industries, JetBrains
-- A test in `crates/agent_servers/src/acp.rs:3234` references `0.32.0`; Zed bounds the npm version by build date via `bounded_npm_package_spec`, but the package and repo are the same.
-- Adapter dependencies (from `package.json`): `@agentclientprotocol/sdk@0.22.1`, `@anthropic-ai/claude-agent-sdk@0.3.156`, `zod`. The adapter is a thin ACP↔SDK bridge; the Claude Agent SDK owns all session/transcript state.
+- Live registry entry for `claude-acp`: name "Claude Agent", version `0.39.0`, npx `@agentclientprotocol/claude-agent-acp@0.39.0`, repo `github.com/agentclientprotocol/claude-agent-acp`, authors Anthropic / Zed Industries / JetBrains. (A test at `crates/agent_servers/src/acp.rs:3234` references `0.32.0`; Zed bounds the npm version by build date, same package/repo.)
+- Adapter deps: `@agentclientprotocol/sdk@0.22.1`, `@anthropic-ai/claude-agent-sdk@0.3.156`, `zod`. The adapter is a thin ACP↔SDK bridge; the Claude Agent SDK owns all session/transcript state.
 
 ## Step 2 — Does the adapter echo `message_id`?
 
-**No.** Confirmed by source inspection of the cloned adapter at `0.39.0`:
+**No.** `grep -rn "messageId|userMessageId|message_id"` over the adapter `src/` returns zero matches. In `prompt()` (`src/acp-agent.ts:732`) it ignores `params.message_id` and generates its own:
+```ts
+const userMessage = promptToClaude(params);
+const promptUuid = randomUUID();
+userMessage.uuid = promptUuid;          // persisted as the transcript user-message uuid
+```
+`promptUuid` is used only internally (a pending-message queue; `message.uuid === promptUuid` at `src/acp-agent.ts:1162`). It is never linked to the ACP `message_id`.
 
-- `grep -rn "messageId|userMessageId|message_id"` over `src/` returns **zero** matches. The adapter never reads `params.message_id` from `PromptRequest` and never sets `user_message_id` on `PromptResponse`.
-- In `prompt()` (`src/acp-agent.ts:732`), the adapter generates its **own** per-message id and ignores the client's:
-  ```ts
-  const userMessage = promptToClaude(params);
-  const promptUuid = randomUUID();
-  userMessage.uuid = promptUuid;
-  ```
-  `promptUuid` is used internally only (a `pendingMessages` queue, and `message.uuid === promptUuid` at `src/acp-agent.ts:1162` to detect the prompt's own echo). It is persisted into the SDK transcript as the user message's uuid, but is never linked to the ACP `message_id`.
+**Implication:** Task 2 (Zed sends `message_id`) is correct and harmless but inert until the adapter records the id↔uuid mapping needed to pick a rewind point.
 
-**Implication:** Task 2 (Zed sends `message_id`) lands cleanly and harmlessly, but on its own buys nothing until the adapter is changed to (a) honor/echo it and (b) remember which SDK transcript uuid it maps to.
+## Step 3 — Native rewind mechanism in the SDK
 
-## Step 3 — Can the adapter trim its context to a message?
+The full `@anthropic-ai/claude-agent-sdk@0.3.156` surface (`sdk.d.ts`) contains, verbatim:
 
-**Not with the current SDK surface; only via SDK changes or fragile transcript editing.**
+- **`Options.resumeSessionAt?: string`** (`sdk.d.ts:1703-1707`):
+  > "When resuming, only resume messages up to and including the message with this UUID. Use with `resume`. This allows you to resume from a specific point in the conversation. The message ID should be from `SDKAssistantMessage.uuid`."
+- **`forkSession(sessionId, options)`** (`sdk.d.ts:654-684`):
+  > "Fork a session into a new branch with fresh UUIDs... Supports `upToMessageId` for branching from a specific point in the conversation."
+  with `ForkSessionOptions.upToMessageId?: string` — "Slice transcript up to this message UUID (inclusive). If omitted, full copy." Returns a new `sessionId` resumable via `query({ options: { resume } })`.
+- **`Query.rewindFiles(userMessageId, { dryRun? })`** (`sdk.d.ts:2291-2300`) + **`Options.enableFileCheckpointing`** (`sdk.d.ts:1406-1413`):
+  > "Rewind tracked files to their state at a specific user message. Requires file checkpointing."
 
-What the adapter has to work with (full `@anthropic-ai/claude-agent-sdk` import surface in `src/acp-agent.ts:47-67`):
-`CanUseTool, deleteSession, getSessionMessages, listSessions, McpServerConfig, ModelInfo, ModelUsage, Options, PermissionMode, PermissionUpdate, Query, query, Settings, SDKAssistantMessageError, SDKMessageOrigin, SDKPartialAssistantMessage, SDKUserMessage, SlashCommand`.
+Transcript model: messages are uuid-keyed with a `parentUuid` chain; the SDK persists per-session transcripts read via `getSessionMessages` / `listSessions` (used by the adapter's `replaySessionHistory`, `src/acp-agent.ts:1556`).
 
-- **No** `rewind`, `truncate`, `editMessage`, `revert`, `undo`, `setMessages`, `removeMessages`, or `checkpoint` is imported or used. Grep over `src/` confirms none exist.
-- Session control primitives actually used:
-  - `query(...)` with `resume: <sessionId>` — continue an existing session with its full transcript (`createSession`, `src/acp-agent.ts:1921`, `2150`).
-  - `query(...)` with `resume: <sessionId>, forkSession: true` — `unstable_forkSession` (`src/acp-agent.ts:663-680`) branches the **entire** session; there is no "fork at message N".
-  - `deleteSession` — removes a whole session.
-  - `getSessionMessages(sessionId)` / `listSessions({dir})` — read the SDK-managed, file-based transcript. `replaySessionHistory` (`src/acp-agent.ts:1556`) iterates `getSessionMessages` and emits ACP `session/update` notifications, so `session/load` is pure agent-side replay.
-- Advertised capabilities (`src/acp-agent.ts:615-637`): `loadSession`, and `sessionCapabilities: { additionalDirectories, close, delete, fork, list, resume }`. **No `truncate`.**
+**What the adapter uses today (and the gap):** it uses `query` with `resume: sessionId` and the whole-session `Options.forkSession: boolean` flag (`unstable_forkSession`, `src/acp-agent.ts:663`). It does **not** use `resumeSessionAt`, the standalone `forkSession({upToMessageId})` function, or `rewindFiles`. So neither point-in-time primitive is exposed over ACP yet.
 
-**Viable implementation paths for a real rewind, in order of preference:**
+## Recommended mechanism
 
-1. **New SDK rewind primitive.** Ask the `@anthropic-ai/claude-agent-sdk` owners (Anthropic) for a supported "resume session truncated at message uuid" (or equivalent). This is the clean path and the one Plan B should target. Requires SDK work outside both Zed and the adapter.
-2. **Transcript trim + resume.** Because the transcript is file-based and uuid-keyed, the adapter could locate the session transcript, drop entries at/after the boundary uuid, then `resume`/`forkSession`. This is **unsupported and fragile**: it depends on the SDK tolerating externally-edited transcripts, and is undermined by automatic compaction (below).
-3. **Fork-as-rewind is not viable** on its own: `forkSession` duplicates the full context, with no message boundary.
-
-**Compaction caveat:** `prompt()` tracks `compactionInProgress` (`src/acp-agent.ts` ~760) because the SDK auto-compacts context within long turns. After compaction, earlier turns may not survive as discrete messages, so even a perfect id mapping cannot guarantee a precise truncation. Any rewind design must define behavior across a compaction boundary (e.g. refuse, or fall back to nearest surviving boundary).
+1. **Truncating resume (preferred).** Adapter handles a new `session/truncate { session_id, message_id }` by starting the next `query` with `resume: <sdkSessionId>, resumeSessionAt: <uuid of the assistant turn immediately before the edited user message>`, then sending the edited prompt. Keeps the ACP session id stable.
+   - Requires the adapter to map the ACP `message_id` (now sent by Zed) to the right transcript uuid. `resumeSessionAt` wants an `SDKAssistantMessage.uuid`; to rewind to "before user message N" the adapter resumes up to the assistant message preceding N. It already observes SDK messages during `prompt()` and can record, per ACP user message, the surrounding transcript uuids.
+2. **Fork-at-message (alternative).** `forkSession(sdkSessionId, { upToMessageId })` slices to a uuid and yields a new session id — simpler id semantics for "up to and including message X", but the ACP session id changes, so Zed's session bookkeeping must re-key.
+3. **File restore (optional, native).** `enableFileCheckpointing` + `rewindFiles(userMessageId)` could restore the working tree natively at the rewind point, as an alternative or complement to Zed's existing git checkpoint.
 
 ## Consequences for the plan
 
-- **Plan A (protocol verb):** unchanged and correct. Proceed when prioritized.
-- **Task 2 (message_id threading):** still the right first step, but document that it is inert until the adapter records the id mapping. Worth landing regardless (spec-compliant, harmless).
-- **Plan B (adapter):** **re-scope and gate on the Claude Agent SDK.** Before committing, raise with the SDK owners whether a rewind/resume-at-message primitive exists or can be added. If not, the only Zed-side-only alternative is the spec's explicitly-rejected lossy "new session + replay" rebuild — which the requester ruled out. Surface this to the requester as a decision point.
-- **Capability gating (Plan C):** the generic, capability-gated approach is validated — the adapter already advertises `sessionCapabilities` flags (`close`, `resume`, `fork`, etc.), so adding a `truncate` flag fits the existing pattern exactly, and Zed branching on `session_capabilities.truncate.is_some()` mirrors `resume`/`close` handling.
+- **Plan A (protocol verb):** unchanged and correct. Add `session/truncate` + a `truncate` capability flag.
+- **Task 2 (message_id threading):** correct first step; document that it is inert until the adapter records the id↔uuid mapping. Landed.
+- **Plan B (adapter):** **feasible now, not blocked.** Scope: record the id↔uuid mapping in `prompt()`, advertise `sessionCapabilities.truncate`, and implement the handler via `resumeSessionAt` (or `forkSession({upToMessageId})`). Validate behavior across a compaction boundary (refuse, or fall back to the nearest surviving boundary, if needed).
+- **Plan C (Zed wiring):** the generic capability-gated approach is validated — the adapter already advertises `sessionCapabilities` flags (`close`, `resume`, `fork`, `delete`, `list`), so a `truncate` flag and Zed branching on `session_capabilities.truncate.is_some()` mirror the existing `resume`/`close` handling exactly.
+
+## Cross-repo reality (separate from feasibility)
+
+Feasibility is now confirmed, but the work still lives in repos outside this checkout: the `session/truncate` verb in the `agent-client-protocol` crate (crates.io, pinned `=0.12.1`), and the handler in the `claude-agent-acp` npm repo. Both are Zed-owned and straightforward given the SDK primitive exists; they cannot be built from the Zed monorepo working tree.
 
 ## Artifacts
 
-- Adapter source inspected: shallow clone of `github.com/agentclientprotocol/claude-agent-acp` @ `0.39.0` (removed after inspection).
-- Key files: `src/acp-agent.ts` (capabilities `615-637`, `newSession`/`forkSession`/`resumeSession`/`loadSession` `651-705`, `prompt` `732`, `replaySessionHistory` `1556`, `createSession` `1933`), `package.json`.
+- Adapter source: shallow clone of `github.com/agentclientprotocol/claude-agent-acp@0.39.0` (removed after inspection).
+- SDK types: `@anthropic-ai/claude-agent-sdk@0.3.156` `sdk.d.ts` (fetched from jsDelivr). Key lines: `forkSession` 654-684, `resumeSessionAt` 1703-1707, `forkSession` boolean flag 1429, `rewindFiles` 2291-2300, `enableFileCheckpointing` 1406-1413.
+- Adapter key files: `src/acp-agent.ts` (capabilities 615-637, session methods 651-705, `prompt` 732, `replaySessionHistory` 1556, `createSession` 1933), `package.json`.

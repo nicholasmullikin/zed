@@ -232,10 +232,12 @@ These phases cannot be expressed as compiling, file-exact tasks today: the proto
 - **Done when:** Zed compiles against the new version and the types are referenceable.
 
 ### Plan B — Claude adapter: implement `session/truncate` (`@agentclientprotocol/claude-agent-acp`)
-- Implement the handler: drop all turns after `message_id` from the adapter's per-session context (informed by Task 1, Step 3).
-- Advertise `session_capabilities.truncate` in the initialize handshake.
-- Ensure `message_id` is echoed as `userMessageId` if Task 1 found it missing.
-- **Done when:** a manual `session/truncate` against a running adapter trims context and the capability is advertised.
+Task 1 confirmed the native mechanism exists in `@anthropic-ai/claude-agent-sdk@0.3.156` — no new Anthropic primitive is required.
+- In `prompt()` (`src/acp-agent.ts:732`), record an `acpMessageId → SDK transcript uuid` mapping (and echo `message_id` as `userMessageId`), since the adapter currently ignores the client id.
+- Implement the `session/truncate` handler using the SDK's **`resumeSessionAt`** query option (preferred — keeps the session id) or **`forkSession(sessionId, { upToMessageId })`** (new session id). Resume up to the assistant turn preceding the edited user message, then accept the edited prompt.
+- Advertise `sessionCapabilities.truncate` in the initialize handshake (sibling of the existing `resume`/`fork`/`close`/`delete`/`list` flags at `src/acp-agent.ts:629-637`).
+- Validate behavior across an auto-compaction boundary (refuse, or fall back to the nearest surviving boundary).
+- **Done when:** a manual `session/truncate` against a running adapter trims context via `resumeSessionAt`/`forkSession` and the capability is advertised.
 
 ### Plan C — Zed truncate-wiring (this repo; small, depends on Plan A)
 - Implement `AcpConnection::truncate()` in `crates/agent_servers/src/acp.rs` to return an `AgentSessionTruncate` whose `run()` sends a `session/truncate` request; gate on `self.agent_capabilities.session_capabilities.truncate.is_some()`. Place the capability check alongside `supports_load_session` / `supports_resume_session` / `supports_close_session` (acp.rs:1721-1821); the prompt-sending pattern to follow is the existing `prompt()` at acp.rs:1958.
@@ -245,7 +247,7 @@ These phases cannot be expressed as compiling, file-exact tasks today: the proto
 ### Plan D — UX, edge cases, tests (this repo; depends on Plan C)
 - Cancel any in-flight prompt before issuing `session/truncate`; surface RPC failures to the UI rather than dropping them.
 - Keep the edit affordance disabled for any message whose `id` is `None` (e.g. older sessions loaded before ids were threaded).
-- Leave git-checkpoint behavior unchanged (the separate **Restore Checkpoint** button, driven by `Checkpoint.show`, is independent).
+- Leave git-checkpoint behavior unchanged (the separate **Restore Checkpoint** button, driven by `Checkpoint.show`, is independent). Optionally evaluate the SDK's native `rewindFiles(userMessageId)` + `enableFileCheckpointing` as an alternative/complement to the git checkpoint for restoring the working tree at the rewind point.
 - Extend `StubAgentConnection` / `FakeAgentConnection` (in `crates/agent_servers/src/acp.rs` and `crates/acp_thread/src/connection.rs`) to advertise and honor truncate; test the rewind path end to end, capability gating (button hidden when unsupported), the `message_id` round-trip, and the no-`message_id` edge case. Per CLAUDE.md, use `cx.background_executor().timer(...)` (not `smol::Timer::after`) in any test driving `run_until_parked()`.
 
 ---
