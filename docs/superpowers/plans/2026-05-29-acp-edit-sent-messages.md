@@ -4,7 +4,7 @@
 
 **Goal:** Let users edit a previously sent user message and regenerate from that point when talking to external ACP agents (Claude Code first), by making the agent's server-side session forget everything after the edited message.
 
-**Architecture:** Reuse Zed's existing inline-edit + Regenerate UI and `AcpThread::rewind()` path, which already call `AgentConnection::truncate()`. The missing pieces are: (a) a new `session/truncate` verb in the `agent-client-protocol` crate, (b) its implementation in the Claude adapter, and (c) an `AcpConnection::truncate()` wiring that calls it, gated on an advertised capability. A foundational prerequisite — sending the client's `message_id` on each prompt — is buildable in this repo today and lands first.
+**Architecture:** Reuse Zed's existing inline-edit + Regenerate UI and `AcpThread::rewind()` path, which already call `AgentConnection::truncate()`. The missing pieces, per upstream RFD [#1214 "Session Rewind"](https://github.com/agentclientprotocol/agent-client-protocol/pull/1214), are: (a) the `session/rewind` + `session/edit_prompt` methods (and `rewindSession` capability) in the `agent-client-protocol` crate, (b) their implementation in the Claude adapter via the SDK's `resumeSessionAt`, and (c) an `AcpConnection::truncate()` wiring that dispatches them, gated on the advertised capability. A foundational prerequisite — sending the client's `message_id` on each prompt — is buildable in this repo today and lands first.
 
 **Tech Stack:** Rust, GPUI, the `agent-client-protocol` crate (Zed-published), the `@agentclientprotocol/claude-agent-acp` npm adapter (Zed-published, outside this tree).
 
@@ -15,12 +15,12 @@
 The full feature has a hard dependency chain:
 
 ```
-Task 1 spike  →  protocol crate verb  →  Claude adapter  →  Zed truncate-wiring (UI lights up)
-                                                              ▲
-Task 2 message-ID threading (this repo, no upstream dep) ────┘ (prerequisite)
+Task 1 spike  →  RFD #1214 accepted  →  protocol methods  →  Claude adapter  →  Zed rewind-wiring (UI lights up)
+                                                                                 ▲
+Task 2 message-ID threading (this repo, no upstream dep) ───────────────────────┘ (prerequisite)
 ```
 
-Only **Task 1** (a research spike) and **Task 2** (message-ID threading) can be written as concrete, compiling work against the current tree. The protocol verb requires bumping the pinned `agent-client-protocol = "=0.12.1"` to a version that does not yet exist; the adapter lives in a separate npm repo. Those phases are captured as the **Gated follow-on roadmap** at the end and become their own plans once Task 1 resolves and the protocol release lands. This split follows the writing-plans scope-check guidance: each plan must produce working, testable software on its own.
+Only **Task 1** (a research spike) and **Task 2** (message-ID threading) can be written as concrete, compiling work against the current tree. The protocol methods (`session/rewind` / `session/edit_prompt`) require RFD #1214 to be championed/accepted, then released, then Zed's pinned `agent-client-protocol = "=0.12.1"` bumped; the adapter lives in a separate npm repo. Those phases are captured as the **Gated follow-on roadmap** at the end and become their own plans once the RFD lands. This split follows the writing-plans scope-check guidance: each plan must produce working, testable software on its own.
 
 ---
 
@@ -34,7 +34,7 @@ Only **Task 1** (a research spike) and **Task 2** (message-ID threading) can be 
 
 ## Task 1: Feasibility spike — probe the running Claude adapter
 
-This is a **research task**, not TDD. Its output is a written findings note plus a go/no-go on the dedicated-`session/truncate`-verb approach. Do not write production code in this task.
+This is a **research task**, not TDD. Its output is a written findings note plus a recommendation on the rewind mechanism. (Outcome: the SDK has a native rewind primitive and upstream RFD #1214 already specifies the protocol surface — so the recommendation is to align to the RFD, not invent a verb.) Do not write production code in this task.
 
 **Files:**
 - Create: `docs/superpowers/specs/2026-05-29-acp-truncate-feasibility-findings.md`
@@ -65,8 +65,8 @@ Read the adapter source for how it stores conversation/context per session and w
 
 - [ ] **Step 4: Write the findings note and a recommendation**
 
-Create `docs/superpowers/specs/2026-05-29-acp-truncate-feasibility-findings.md` answering Steps 1–3, plus an explicit recommendation:
-- **Go (dedicated verb):** proceed to design `session/truncate` in the protocol crate (the spec's primary path).
+Create `docs/superpowers/specs/2026-05-29-acp-truncate-feasibility-findings.md` answering Steps 1–3, plus an explicit recommendation. Also search the protocol and adapter repos for any existing or in-progress rewind/edit work before proposing a new verb.
+- **Align (chosen):** upstream RFD #1214 already proposes `session/rewind` + `session/edit_prompt`, and the Claude Agent SDK already has the rewind primitive (`resumeSessionAt` / `forkSession({upToMessageId})`). Adopt the RFD design; do not invent a separate verb.
 - **Adapt:** the adapter already exposes something usable — describe how to wire to it instead.
 - **Blocked:** the adapter cannot trim context cleanly — re-scope the adapter work and flag it to the requester.
 
@@ -226,35 +226,35 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 These phases cannot be expressed as compiling, file-exact tasks today: the protocol types do not exist at the pinned version, and the adapter lives in a different repo. Each becomes its own plan once Task 1 resolves and the protocol release lands. They are listed here for sequencing and scope only — intentionally deferred, not placeholders.
 
-### Plan A — Protocol: add `session/truncate` (`agent-client-protocol` crate)
-- Add an `unstable_session_truncate` feature, `SessionTruncateCapabilities` on `SessionCapabilities`, `TruncateSessionRequest { session_id, message_id }`, `TruncateSessionResponse`, and the `session/truncate` method — mirroring the existing `session/fork` / `session/resume` definitions (`src/v1/agent.rs`).
+### Plan A — Protocol: land RFD #1214 `session/rewind` + `session/edit_prompt` (`agent-client-protocol`)
+- Champion/accept [RFD #1214](https://github.com/agentclientprotocol/agent-client-protocol/pull/1214), then implement behind an `unstable_session_rewind` feature: `RewindSessionRequest { session_id, to_message_id }` / `RewindSessionResponse { remaining_message_count, last_message_id }`, `EditPromptRequest { session_id, message_id, new_content }` (response aliases `PromptResponse`), the `session/rewind` + `session/edit_prompt` methods, and the `rewindSession { supported, supportsEditPrompt }` agent capability — following `AGENTS.md` conventions and the existing `session/fork` / `session/resume` shapes (`src/v1/agent.rs`).
 - Release the crate and bump Zed's `Cargo.toml:508` pin (`agent-client-protocol = "=0.12.1"`) to the new version.
 - **Done when:** Zed compiles against the new version and the types are referenceable.
 
-### Plan B — Claude adapter: implement `session/truncate` (`@agentclientprotocol/claude-agent-acp`)
-Task 1 confirmed the native mechanism exists in `@anthropic-ai/claude-agent-sdk@0.3.156` — no new Anthropic primitive is required.
+### Plan B — Claude adapter: implement `session/rewind` + `session/edit_prompt` (`@agentclientprotocol/claude-agent-acp`)
+Task 1 confirmed the native mechanism exists in `@anthropic-ai/claude-agent-sdk@0.3.156` — no new Anthropic primitive is required. (Tracks adapter issue [#460 "/rewind"](https://github.com/agentclientprotocol/claude-agent-acp/issues/460).)
 - In `prompt()` (`src/acp-agent.ts:732`), record an `acpMessageId → SDK transcript uuid` mapping (and echo `message_id` as `userMessageId`), since the adapter currently ignores the client id.
-- Implement the `session/truncate` handler using the SDK's **`resumeSessionAt`** query option (preferred — keeps the session id) or **`forkSession(sessionId, { upToMessageId })`** (new session id). Resume up to the assistant turn preceding the edited user message, then accept the edited prompt.
-- Advertise `sessionCapabilities.truncate` in the initialize handshake (sibling of the existing `resume`/`fork`/`close`/`delete`/`list` flags at `src/acp-agent.ts:629-637`).
+- Implement `session/rewind` using the SDK's **`resumeSessionAt`** query option (preferred — keeps the session id) or **`forkSession(sessionId, { upToMessageId })`** (new session id). Implement `session/edit_prompt` as rewind-to-before + replace + re-run.
+- Advertise `agentCapabilities.rewindSession { supported, supportsEditPrompt }` in the initialize handshake (sibling of the existing `resume`/`fork`/`close`/`delete`/`list` flags at `src/acp-agent.ts:629-637`).
 - Validate behavior across an auto-compaction boundary (refuse, or fall back to the nearest surviving boundary).
-- **Done when:** a manual `session/truncate` against a running adapter trims context via `resumeSessionAt`/`forkSession` and the capability is advertised.
+- **Done when:** a manual `session/rewind` / `session/edit_prompt` against a running adapter trims context via `resumeSessionAt`/`forkSession` and the capability is advertised.
 
-### Plan C — Zed truncate-wiring (this repo; small, depends on Plan A)
-- Implement `AcpConnection::truncate()` in `crates/agent_servers/src/acp.rs` to return an `AgentSessionTruncate` whose `run()` sends a `session/truncate` request; gate on `self.agent_capabilities.session_capabilities.truncate.is_some()`. Place the capability check alongside `supports_load_session` / `supports_resume_session` / `supports_close_session` (acp.rs:1721-1821); the prompt-sending pattern to follow is the existing `prompt()` at acp.rs:1958.
+### Plan C — Zed rewind-wiring (this repo; small, depends on Plan A)
+- Implement `AcpConnection::truncate()` in `crates/agent_servers/src/acp.rs` to return an `AgentSessionTruncate` whose `run()` sends a `session/rewind` request (and a `session/edit_prompt` path for the edit case); gate on `self.agent_capabilities.rewind_session` being advertised. Place the capability check alongside `supports_load_session` / `supports_resume_session` / `supports_close_session` (acp.rs:1721-1821); the prompt-sending pattern to follow is the existing `prompt()` at acp.rs:1958.
 - This flips `AcpThread::supports_truncate(cx)` (acp_thread.rs:1435) true for capable agents, so the existing inline editor, `editing_message` state, and **Regenerate** button in `crates/agent_ui/src/conversation_view/thread_view.rs` and the existing `AcpThread::rewind()` (acp_thread.rs:2596) engage with no UI rewrite.
 - Update the disabled-state tooltip in `thread_view.rs` ("Editing previous messages is not available for … yet") so it only shows for agents that genuinely lack the capability.
 
 ### Plan D — UX, edge cases, tests (this repo; depends on Plan C)
-- Cancel any in-flight prompt before issuing `session/truncate`; surface RPC failures to the UI rather than dropping them.
+- Per the RFD the agent cancels any active turn before rewinding; confirm Zed's path matches. Surface `session/rewind` / `session/edit_prompt` RPC failures to the UI rather than dropping them.
 - Keep the edit affordance disabled for any message whose `id` is `None` (e.g. older sessions loaded before ids were threaded).
-- Leave git-checkpoint behavior unchanged (the separate **Restore Checkpoint** button, driven by `Checkpoint.show`, is independent). Optionally evaluate the SDK's native `rewindFiles(userMessageId)` + `enableFileCheckpointing` as an alternative/complement to the git checkpoint for restoring the working tree at the rewind point.
-- Extend `StubAgentConnection` / `FakeAgentConnection` (in `crates/agent_servers/src/acp.rs` and `crates/acp_thread/src/connection.rs`) to advertise and honor truncate; test the rewind path end to end, capability gating (button hidden when unsupported), the `message_id` round-trip, and the no-`message_id` edge case. Per CLAUDE.md, use `cx.background_executor().timer(...)` (not `smol::Timer::after`) in any test driving `run_until_parked()`.
+- Leave git-checkpoint behavior unchanged (the separate **Restore Checkpoint** button, driven by `Checkpoint.show`, is independent — filesystem rollback is out of the protocol per the RFD). Optionally evaluate the SDK's native `rewindFiles(userMessageId)` + `enableFileCheckpointing` as an alternative/complement for restoring the working tree at the rewind point.
+- Extend `StubAgentConnection` / `FakeAgentConnection` (in `crates/agent_servers/src/acp.rs` and `crates/acp_thread/src/connection.rs`) to advertise `rewindSession` and honor `session/rewind` / `session/edit_prompt`; test the rewind path end to end, capability gating (button hidden when unsupported), the `message_id` round-trip, and the no-`message_id` edge case. Per CLAUDE.md, use `cx.background_executor().timer(...)` (not `smol::Timer::after`) in any test driving `run_until_parked()`.
 
 ---
 
 ## Self-Review
 
-**Spec coverage:** Spec Phase 0 → Task 1. Spec Phase 1 (message-ID threading, the separable foundational half) → Task 2; the new `session/truncate` half of Phase 1 → Plan A. Spec Phase 2 → Plan B. Spec Phase 3 → Plan C. Spec Phases 4–5 → Plan D. All spec phases are accounted for.
+**Spec coverage:** Spec Phase 0 → Task 1. Spec Phase 1 (message-ID threading, the separable foundational half) → Task 2; the RFD #1214 `session/rewind` + `session/edit_prompt` half of Phase 1 → Plan A. Spec Phase 2 → Plan B. Spec Phase 3 → Plan C. Spec Phases 4–5 → Plan D. All spec phases are accounted for.
 
 **Placeholder scan:** Tasks 1 and 2 contain concrete commands, real code, and exact expected output. Plans A–D are explicitly marked as deferred sub-plans gated on Task 1 / the protocol release, with concrete scope and file references — they are sequencing entries, not in-task placeholders.
 

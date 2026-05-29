@@ -2,18 +2,18 @@
 
 **Date:** 2026-05-29
 **Spike for:** [2026-05-29-acp-edit-sent-messages-design.md](./2026-05-29-acp-edit-sent-messages-design.md), Task 1 of [the plan](../plans/2026-05-29-acp-edit-sent-messages.md)
-**Method:** Inspected the live ACP registry, a shallow clone of the Claude adapter source (`github.com/agentclientprotocol/claude-agent-acp@0.39.0`), and the published `@anthropic-ai/claude-agent-sdk@0.3.156` type definitions (`sdk.d.ts`).
+**Method:** Inspected the live ACP registry; a shallow clone of the Claude adapter source (`github.com/agentclientprotocol/claude-agent-acp@0.39.0`); the published `@anthropic-ai/claude-agent-sdk@0.3.156` type definitions (`sdk.d.ts`); and the latest `main` branches of `agentclientprotocol/agent-client-protocol` + `agentclientprotocol/rust-sdk` plus their open issues/PRs.
 
-> **Correction (revised after deeper review):** An earlier version of this note concluded the Claude Agent SDK had "no rewind primitive." **That was wrong** — it was based only on the functions the *adapter imports*, not the full SDK API. Inspecting the SDK's own `sdk.d.ts` shows native, documented rewind primitives. The corrected conclusion is below.
+> **Two revisions, both after deeper review:** (1) an earlier version concluded the SDK had "no rewind primitive" — **wrong**, it was based only on what the *adapter imports*; the SDK's `sdk.d.ts` has native primitives. (2) a second pass of the protocol/adapter repos found an **open draft RFD that already specifies the protocol surface** for this feature, so the design should align to it rather than invent a verb.
 
 ## TL;DR
 
-**Recommendation: GO. A native rewind mechanism exists in the Claude Agent SDK. Plan B (adapter) is feasible without any new Anthropic primitive — it is "expose an existing SDK capability over ACP."**
+**Recommendation: GO, and align to upstream [RFD #1214 "Session Rewind"](https://github.com/agentclientprotocol/agent-client-protocol/pull/1214).** Both halves of the stack are further along than first thought: the protocol has a drafted design, and the SDK already has the implementing primitive.
 
-- The SDK provides **`resumeSessionAt`** (a `query` option: resume a session truncated to a message UUID, same session id) and **`forkSession(sessionId, { upToMessageId })`** (slice the transcript up to a message UUID into a new session). Either can implement "forget everything after message N."
-- It also provides **`rewindFiles(userMessageId)`** (with `enableFileCheckpointing`) — a native restore of tracked files to their state at a user message, a built-in analogue of Zed's git checkpoint.
-- The adapter does **not** surface any of these today, and it does **not** echo or map the ACP `message_id`. So the remaining work is real but bounded: thread `message_id` (Task 2, done), have the adapter record an `acpMessageId → SDK transcript uuid` mapping, and add a `session/truncate` handler that calls `resumeSessionAt` (or `forkSession({upToMessageId})`).
-- One genuine caveat to validate, not assume: the SDK auto-compacts context mid-turn (the adapter tracks `compactionInProgress`). Rewinding across a compaction boundary needs testing, but since these rewind features are first-class SDK features (Claude Code's interactive rewind uses them), the SDK most likely handles it.
+- **Upstream protocol design exists:** RFD #1214 (open, **draft, "open for champion from the core team"**) proposes `session/rewind { sessionId, toMessageId }` and `session/edit_prompt { sessionId, messageId, newContent }`, gated `unstable_session_rewind`, built on `unstable_message_id`, with an `agentCapabilities.rewindSession { supported, supportsEditPrompt }` flag. It is motivated by Zed issues #52153 / #39997 / #28676 / #55888. The adapter has an open `/rewind` issue (#460) too. **We adopt this design** instead of inventing `session/truncate`.
+- **SDK primitive exists:** `resumeSessionAt` (resume truncated to a message uuid, same session id) and `forkSession(sessionId, { upToMessageId })` (slice to a uuid into a new session). Plus `rewindFiles(userMessageId)` + `enableFileCheckpointing` for native file restore.
+- The adapter surfaces none of these today and does **not** echo/map the ACP `message_id`. Remaining work is bounded: land RFD #1214 in the protocol crate, have the adapter map `acpMessageId → SDK transcript uuid` and implement the methods via `resumeSessionAt`, then wire Zed (Plan C).
+- One caveat to validate, not assume: the SDK auto-compacts context mid-turn (the adapter tracks `compactionInProgress`). Rewinding across a compaction boundary needs testing, though these are first-class SDK features.
 
 ## Step 1 — Exact adapter Zed launches
 
@@ -50,26 +50,41 @@ Transcript model: messages are uuid-keyed with a `parentUuid` chain; the SDK per
 
 **What the adapter uses today (and the gap):** it uses `query` with `resume: sessionId` and the whole-session `Options.forkSession: boolean` flag (`unstable_forkSession`, `src/acp-agent.ts:663`). It does **not** use `resumeSessionAt`, the standalone `forkSession({upToMessageId})` function, or `rewindFiles`. So neither point-in-time primitive is exposed over ACP yet.
 
+## Step 4 — Upstream protocol design: RFD #1214
+
+Searching the protocol/adapter repos surfaced an open draft RFD that specifies exactly this feature, so the design should converge on it rather than invent a parallel verb.
+
+- **`agent-client-protocol` PR #1214 — "docs(rfd): Session Rewind"** (open; author `htahaozlu`; `docs/rfds/session-rewind.mdx`). Proposes two methods, both gated `unstable_session_rewind`, both depending on `unstable_message_id`:
+  - **`session/rewind { sessionId, toMessageId }` → `{ remainingMessageCount, lastMessageId }`** — "treat history up to and including `toMessageId` as canonical, discard everything after." Next `session/prompt` continues from there; no implicit re-prompt; agent cancels an active turn first; filesystem rollback explicitly out of scope.
+  - **`session/edit_prompt { sessionId, messageId, newContent }` → same shape as `session/prompt`** — replace a **user** message's content and re-run its turn (= rewind-to-before + replace + re-run with the original model/MCP/tools). This is the direct mapping of "edit a previously sent message."
+  - Capability: `agentCapabilities.rewindSession { supported, supportsEditPrompt }`.
+- **Status:** draft, explicitly "open for champion from the core team" — designed, not accepted or implemented. Consolidates discussions #239 (checkpoint restore) and #329 (`session/undo`/`redo`). Motivated by Zed issues #52153, #39997, #28676, #55888.
+- **Released code, latest `main`:** no rewind/edit/truncate verb in the protocol (schema 0.13.4 / rust crate 0.12.1) or the adapter (0.39.0). Adapter issue #460 "/rewind" is an empty placeholder. So nothing is *shipped*, but the design is drafted and the SDK primitive is ready.
+
 ## Recommended mechanism
 
-1. **Truncating resume (preferred).** Adapter handles a new `session/truncate { session_id, message_id }` by starting the next `query` with `resume: <sdkSessionId>, resumeSessionAt: <uuid of the assistant turn immediately before the edited user message>`, then sending the edited prompt. Keeps the ACP session id stable.
+Adopt RFD #1214's two methods (do not invent `session/truncate`), backed by the SDK primitive:
+
+1. **`session/rewind` via `resumeSessionAt` (preferred).** Adapter handles `session/rewind { sessionId, toMessageId }` by starting the next `query` with `resume: <sdkSessionId>, resumeSessionAt: <transcript uuid for toMessageId>`. Keeps the ACP session id stable.
    - Requires the adapter to map the ACP `message_id` (now sent by Zed) to the right transcript uuid. `resumeSessionAt` wants an `SDKAssistantMessage.uuid`; to rewind to "before user message N" the adapter resumes up to the assistant message preceding N. It already observes SDK messages during `prompt()` and can record, per ACP user message, the surrounding transcript uuids.
-2. **Fork-at-message (alternative).** `forkSession(sdkSessionId, { upToMessageId })` slices to a uuid and yields a new session id — simpler id semantics for "up to and including message X", but the ACP session id changes, so Zed's session bookkeeping must re-key.
-3. **File restore (optional, native).** `enableFileCheckpointing` + `rewindFiles(userMessageId)` could restore the working tree natively at the rewind point, as an alternative or complement to Zed's existing git checkpoint.
+2. **`session/edit_prompt`** = the above rewind to the message before `messageId`, then replace its content and re-run the turn (streaming via `session/update`).
+3. **Fork-at-message (alternative for rewind).** `forkSession(sdkSessionId, { upToMessageId })` slices to a uuid and yields a new session id — but the ACP session id changes, so Zed's bookkeeping must re-key. `resumeSessionAt` avoids that.
+4. **File restore (optional, native).** `enableFileCheckpointing` + `rewindFiles(userMessageId)` could restore the working tree natively at the rewind point; the RFD keeps filesystem rollback out of the protocol, so Zed's git checkpoint stays as-is and this is purely optional.
 
 ## Consequences for the plan
 
-- **Plan A (protocol verb):** unchanged and correct. Add `session/truncate` + a `truncate` capability flag.
-- **Task 2 (message_id threading):** correct first step; document that it is inert until the adapter records the id↔uuid mapping. Landed.
-- **Plan B (adapter):** **feasible now, not blocked.** Scope: record the id↔uuid mapping in `prompt()`, advertise `sessionCapabilities.truncate`, and implement the handler via `resumeSessionAt` (or `forkSession({upToMessageId})`). Validate behavior across a compaction boundary (refuse, or fall back to the nearest surviving boundary, if needed).
-- **Plan C (Zed wiring):** the generic capability-gated approach is validated — the adapter already advertises `sessionCapabilities` flags (`close`, `resume`, `fork`, `delete`, `list`), so a `truncate` flag and Zed branching on `session_capabilities.truncate.is_some()` mirror the existing `resume`/`close` handling exactly.
+- **Plan A (protocol):** champion/accept RFD #1214, then implement `session/rewind` + `session/edit_prompt` + the `rewindSession` capability behind `unstable_session_rewind`. No new verb invented.
+- **Task 2 (message_id threading):** correct first step; the RFD itself names it as the prerequisite ("without operations that consume message IDs, the flag has no user-facing leverage"). Inert until the adapter records the id↔uuid mapping. Landed.
+- **Plan B (adapter):** **feasible now, not blocked.** Scope: record the id↔uuid mapping in `prompt()`, advertise `agentCapabilities.rewindSession`, and implement the methods via `resumeSessionAt` (or `forkSession({upToMessageId})`). Validate behavior across a compaction boundary.
+- **Plan C (Zed wiring):** the generic capability-gated approach is validated — the adapter already advertises `sessionCapabilities` flags (`close`, `resume`, `fork`, `delete`, `list`), so a `rewindSession` flag and Zed branching on it mirror the existing `resume`/`close` handling exactly.
 
 ## Cross-repo reality (separate from feasibility)
 
-Feasibility is now confirmed, but the work still lives in repos outside this checkout: the `session/truncate` verb in the `agent-client-protocol` crate (crates.io, pinned `=0.12.1`), and the handler in the `claude-agent-acp` npm repo. Both are Zed-owned and straightforward given the SDK primitive exists; they cannot be built from the Zed monorepo working tree.
+Feasibility is confirmed and a design exists, but the work still lives outside this checkout, and the first dependency is **social, not technical**: RFD #1214 must be championed/accepted upstream. Then `session/rewind` + `session/edit_prompt` land in `agentclientprotocol/agent-client-protocol` (+ `rust-sdk`, the `agent-client-protocol` crate Zed pins at `=0.12.1`), the handler lands in the `claude-agent-acp` npm repo, and only then can Zed's Plan C compile. None of these can be built from the Zed monorepo working tree.
 
 ## Artifacts
 
 - Adapter source: shallow clone of `github.com/agentclientprotocol/claude-agent-acp@0.39.0` (removed after inspection).
 - SDK types: `@anthropic-ai/claude-agent-sdk@0.3.156` `sdk.d.ts` (fetched from jsDelivr). Key lines: `forkSession` 654-684, `resumeSessionAt` 1703-1707, `forkSession` boolean flag 1429, `rewindFiles` 2291-2300, `enableFileCheckpointing` 1406-1413.
 - Adapter key files: `src/acp-agent.ts` (capabilities 615-637, session methods 651-705, `prompt` 732, `replaySessionHistory` 1556, `createSession` 1933), `package.json`.
+- Protocol repos (latest `main`): `agentclientprotocol/agent-client-protocol` (schema 0.13.4; session verbs `new/load/resume/fork/list/delete/close/prompt/cancel/set_*/update`; no rewind in v1 or v2 unstable) and `agentclientprotocol/rust-sdk` (`agent-client-protocol` crate 0.12.1). RFD: PR #1214 `docs/rfds/session-rewind.mdx`; related `session-fork` / `message-id` RFDs; v2 overview lists "Truncate/Edit support" as a goal.

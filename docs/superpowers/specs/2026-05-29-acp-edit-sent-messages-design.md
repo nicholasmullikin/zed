@@ -1,7 +1,7 @@
 # Editing previously sent messages for external (ACP) agents
 
 **Date:** 2026-05-29
-**Status:** Design approved; pending implementation plan
+**Status:** Design approved; realigned to upstream RFD [`session-rewind` (PR #1214)](https://github.com/agentclientprotocol/agent-client-protocol/pull/1214).
 **Scope:** Capability-gated, generic across ACP agents. Claude Code (`@agentclientprotocol/claude-agent-acp`) is the first target.
 
 ## Problem
@@ -25,20 +25,47 @@ The blocker is architectural, not cosmetic:
 - Each `acp::PromptRequest` carries **only the new user turn** — the agent (the Claude
   adapter) maintains its own conversation context server-side. Zed can truncate its own UI
   entries, but it has no way to tell Claude "forget everything after message N."
-- The ACP protocol (Zed's own `agent-client-protocol` crate, pinned at `=0.12.1` with
-  `features = ["unstable"]` in `Cargo.toml`) has **no truncate / rewind / replay verb**.
-  - `session/fork` (unstable, `unstable_session_fork`) duplicates the *whole* session
-    context — its docs say it creates a branch "without affecting the original session's
-    history," for side tasks like summaries. There is no "fork at message N." Not usable
-    for rewinding.
-  - `session/resume` reconnects to a paused session; `session/load` makes the agent replay
-    its stored history back as `session/update` notifications. Neither edits history.
-  - The only extensibility point on existing calls is the `_meta` field.
+- The ACP protocol (the `agent-client-protocol` crate, pinned at `=0.12.1` with
+  `features = ["unstable"]` in `Cargo.toml`) has **no rewind / edit / truncate verb** — true
+  even on latest `main` (schema 0.13.4 / rust crate 0.12.1). The session verbs are
+  `new / load / resume / fork / list / delete / close / prompt / cancel / set_* / update`.
+  - `session/fork` (unstable) duplicates the *whole* session context for non-destructive
+    side queries — there is no "fork at message N". Not a rewind.
+  - `session/resume` reconnects to a session; `session/load` replays stored history as
+    `session/update` notifications. Neither edits history.
+
+## Upstream design already exists: RFD #1214 (Session Rewind)
+
+The spike (see the feasibility findings doc) found an **open draft RFD** —
+[`docs/rfds/session-rewind.mdx`, PR #1214](https://github.com/agentclientprotocol/agent-client-protocol/pull/1214) —
+that proposes exactly this feature. We adopt its design rather than inventing our own verb.
+The RFD proposes two methods, both gated behind a new `unstable_session_rewind` feature and
+both building on `unstable_message_id`:
+
+- **`session/rewind { sessionId, toMessageId }`** → `{ remainingMessageCount, lastMessageId }`:
+  "treat history up to and including `toMessageId` as canonical, discard everything after."
+  The next `session/prompt` continues from the rewound state. No implicit re-prompt. If a turn
+  is active, the agent cancels it first. Filesystem rollback is explicitly out of scope.
+- **`session/edit_prompt { sessionId, messageId, newContent }`** → same shape as
+  `session/prompt` (streams via `session/update`): replace a **user** message's content and
+  re-run its turn. Defined as an implicit `session/rewind` to the message before `messageId`,
+  then replace + re-run with the original model/MCP/tools. **This is the direct mapping of
+  "edit a previously sent message."**
+- Capability discovery: `agentCapabilities.rewindSession { supported, supportsEditPrompt }`.
+
+RFD status: **draft, "open for champion from the core team"** — designed, not yet accepted or
+implemented. It is motivated by concrete Zed issues
+([zed#52153](https://github.com/zed-industries/zed/issues/52153),
+[zed#39997](https://github.com/zed-industries/zed/issues/39997),
+[zed#28676](https://github.com/zed-industries/zed/issues/28676),
+[zed#55888](https://github.com/zed-industries/zed/issues/55888)).
+There is also an open `/rewind` issue on the adapter
+([claude-agent-acp#460](https://github.com/agentclientprotocol/claude-agent-acp/issues/460)).
 
 ## What already exists in Zed (and can be reused)
 
 The UI and thread plumbing for rewinding an ACP thread are already built; only the
-connection method and the protocol verb behind it are missing.
+connection method and the protocol verbs behind it are missing.
 
 - `AcpThread::rewind(id: UserMessageId)` (`crates/acp_thread/src/acp_thread.rs`) already:
   calls `self.connection.truncate(&self.session_id, cx)`, truncates `self.entries` from the
@@ -54,137 +81,138 @@ connection method and the protocol verb behind it are missing.
   `NativeAgentSessionTruncate` (`crates/agent/src/agent.rs`) return a working
   `AgentSessionTruncate` whose `run()` calls `Thread::truncate()` (`crates/agent/src/thread.rs`).
 
-The new work is therefore concentrated in (a) the protocol crate, (b) the Claude adapter,
-and (c) a small wiring change in `AcpConnection` plus threading message IDs end to end.
+So Zed's existing `AgentConnection::truncate()` / `AcpThread::rewind()` hook stays — for ACP
+agents it simply dispatches `session/rewind` (or `session/edit_prompt`) under the hood.
 
-## Key foundational gap: message IDs
+## Key foundational gap: message IDs (done)
 
 `PromptRequest` already has an (unstable, `unstable_message_id`) `message_id: Option<String>`
-field, and the spec says the agent SHOULD echo it back as `userMessageId` in
-`PromptResponse`. **Zed does not currently populate it** — `acp_thread.rs` builds the request
-with `acp::PromptRequest::new(session_id, message)` and tracks its own `UserMessageId`
-separately, never putting it on the wire or correlating the echo.
+field, and the agent SHOULD echo it as `userMessageId` in `PromptResponse`. **Zed did not
+populate it.** Both `session/rewind` and `session/edit_prompt` reference messages by id, and
+the RFD itself notes that *"without operations that consume message IDs, the flag has no
+user-facing leverage."*
 
-Any rewind must reference "truncate to *this* message," so populating `PromptRequest.message_id`
-from Zed's `UserMessageId` and consuming the echoed `userMessageId` is foundational and must
-land regardless of the rewind mechanism.
+**Status: implemented.** `AcpThread::send` now sets `PromptRequest.message_id` from Zed's
+`UserMessageId` (see the implementation plan, Task 2; landed on the fork). The Claude adapter
+must still record an `acpMessageId → SDK transcript uuid` mapping to honor it.
+
+## The native mechanism exists in the Claude Agent SDK
+
+The spike confirmed `@anthropic-ai/claude-agent-sdk@0.3.156` already provides the rewind
+primitive the adapter would call:
+
+- `Options.resumeSessionAt` — resume a session "only ... up to and including the message with
+  this UUID" (same session id).
+- `forkSession(sessionId, { upToMessageId })` — slice the transcript up to a uuid into a new
+  session.
+- `rewindFiles(userMessageId)` + `enableFileCheckpointing` — native file restore (Zed keeps
+  its own git checkpoint; this is optional).
+
+So no new Anthropic primitive is required — the adapter wires existing SDK calls behind the
+RFD methods.
 
 ## Design decisions
 
-1. **Mechanism: a dedicated protocol method**, `session/truncate`, taking
-   `{ session_id, message_id }`, gated behind a new `unstable_session_truncate` feature and a
-   `SessionTruncateCapabilities` flag on `SessionCapabilities`. Rejected alternative: smuggling
-   truncate through `_meta` (non-standard, avoids a schema bump but contradicts the "do it
-   right" goal).
+1. **Mechanism: adopt RFD #1214** — implement `session/rewind` (the primitive) and
+   `session/edit_prompt` (the edit-message affordance), gated behind `unstable_session_rewind`
+   and `unstable_message_id`. We do **not** invent a separate `session/truncate` verb;
+   converging on the upstream proposal avoids ecosystem divergence and is the path to landing.
 2. **Scope: capability-gated and generic.** Implement on the shared `AcpConnection`, gated on
-   `agent_capabilities.session_capabilities.truncate.is_some()`, mirroring how `load`/`resume`/
-   `close` are already handled (`supports_load_session`, `supports_resume_session`,
-   `supports_close_session`). Any ACP agent advertising the capability enables automatically;
-   Claude is simply first.
-3. **Deliverable spans repos.** The protocol crate (`agent-client-protocol`) and the Claude
-   adapter (`@agentclientprotocol/claude-agent-acp`, a Zed-published npm package outside this
-   tree) are explicitly part of the deliverable. Approved by the requester.
-4. **Lead with a feasibility spike** before committing to the build, since the adapter's
-   current behavior is only knowable by probing the running process.
+   `agent_capabilities.rewindSession.supported` (and `.supportsEditPrompt`), mirroring how
+   `load` / `resume` / `close` are already handled (`supports_load_session`,
+   `supports_resume_session`, `supports_close_session`). Any ACP agent advertising the
+   capability enables automatically; Claude is simply first.
+3. **Deliverable spans repos.** The protocol crate (`agentclientprotocol/agent-client-protocol`
+   + `agentclientprotocol/rust-sdk`) and the Claude adapter
+   (`agentclientprotocol/claude-agent-acp`) are explicitly part of the deliverable, and the
+   first dependency is the RFD being championed/accepted upstream.
+4. **Filesystem rollback stays out of the protocol** (per the RFD). Zed keeps its existing git
+   checkpoint / **Restore Checkpoint** behavior, layered separately.
 
 ## Phases
 
-### Phase 0 — Feasibility spike (decision gate)
+### Phase 0 — Feasibility spike (done)
 
-Probe the **running** `@agentclientprotocol/claude-agent-acp` adapter (it lives outside this
-repo). Answer:
+Outcome: the SDK has a native rewind primitive (`resumeSessionAt` / `forkSession({upToMessageId})`),
+the adapter ignores `message_id` today, and upstream RFD #1214 already specifies the protocol
+surface. See the feasibility findings doc. Recommendation: align to the RFD.
 
-- Does it echo `userMessageId` in `PromptResponse` when Zed sends `message_id`?
-- Does it already expose any rewind/truncate today (via `_meta` or an undocumented method)?
-- What does `session/load` replay look like, and is its transcript store something a truncate
-  could trim?
-- Confirm the adapter version (from the ACP registry,
-  `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`) and where its source
-  lives, so Phase 2 is actionable.
+### Phase 1 — Protocol (`agent-client-protocol`)
 
-**Output:** a short findings note and a go/no-go on the dedicated-method path. If the adapter
-already exposes something usable, adapt the later phases to it; otherwise proceed to build
-`session/truncate`.
+- Land RFD #1214 (champion + acceptance), then implement `unstable_session_rewind`:
+  `RewindSessionRequest/Response`, `EditPromptRequest` (response aliases `PromptResponse`), the
+  `session/rewind` and `session/edit_prompt` methods, and the `rewindSession` agent capability —
+  following `AGENTS.md` conventions and the existing `session/fork` / `session/resume` shapes.
+- Release the crate and bump Zed's pinned `agent-client-protocol = "=0.12.1"` to the new version.
+- **Done in Zed already:** `PromptRequest.message_id` is populated (Task 2).
 
-### Phase 1 — Protocol (`agent-client-protocol` crate)
+### Phase 2 — Claude adapter (`claude-agent-acp`)
 
-- Add the `unstable_session_truncate` feature, `SessionTruncateCapabilities`,
-  `TruncateSessionRequest { session_id, message_id }`, `TruncateSessionResponse`, and the
-  `session/truncate` method, following the shape of the existing `session/fork` and
-  `session/resume` definitions in the schema.
-- Bump Zed's pinned `agent-client-protocol` dependency to the version carrying the new verb.
-- **Separable, foundational:** populate `PromptRequest.message_id` from Zed's `UserMessageId`
-  and consume the echoed `userMessageId` in the `PromptResponse` handling
-  (`crates/agent_servers/src/acp.rs` prompt flow + `crates/acp_thread/src/acp_thread.rs` send
-  flow). This can land and be tested ahead of the truncate verb.
-
-### Phase 2 — Claude adapter (`@agentclientprotocol/claude-agent-acp`)
-
-- Implement `session/truncate`: drop all turns after `message_id` from the adapter's maintained
-  context/transcript.
-- Advertise `session_capabilities.truncate` in the initialize handshake.
-- Ensure `message_id` is echoed as `userMessageId` (if Phase 0 found it missing).
+- In `prompt()` (`src/acp-agent.ts:732`), record an `acpMessageId → SDK transcript uuid`
+  mapping and echo `message_id` as `userMessageId` (the adapter currently ignores it).
+- Implement `session/rewind` via the SDK's `resumeSessionAt` (preferred — keeps the session id)
+  or `forkSession({ upToMessageId })`; implement `session/edit_prompt` as rewind-to-before +
+  replace + re-run.
+- Advertise `agentCapabilities.rewindSession` in the initialize handshake (sibling of the
+  existing `resume`/`fork`/`close`/`delete`/`list` flags at `src/acp-agent.ts:629-637`).
+- Validate behavior across an auto-compaction boundary (refuse, or fall back to the nearest
+  surviving boundary).
 
 ### Phase 3 — Zed integration (this repo, small)
 
-- Implement `AcpConnection::truncate()` to return an `AgentSessionTruncate` whose `run()` sends
-  a `session/truncate` request and resolves when it completes — gated on
-  `agent_capabilities.session_capabilities.truncate.is_some()`. Add a `supports_truncate`-style
-  capability check alongside the existing `supports_load_session` / `supports_resume_session` /
-  `supports_close_session` methods.
+- Wire `AcpConnection::truncate()` to return an `AgentSessionTruncate` whose `run()` issues
+  `session/rewind` (or `session/edit_prompt` for the edit case), gated on
+  `agent_capabilities.rewindSession.supported`. Add the capability check alongside
+  `supports_load_session` / `supports_resume_session` / `supports_close_session`.
 - This flips `AcpThread::supports_truncate(cx)` to `true` for capable agents, so the existing
-  inline-edit + **Regenerate** UI and the existing `AcpThread::rewind()` path engage with no UI
-  rewrite.
-- Update the disabled-state tooltip copy in
-  `crates/agent_ui/src/conversation_view/thread_view.rs` so the "not available yet" message
-  only shows for agents that genuinely lack the capability.
+  inline-edit + **Regenerate** UI and `AcpThread::rewind()` path engage with no UI rewrite.
+- Update the disabled-state tooltip in `crates/agent_ui/src/conversation_view/thread_view.rs`
+  so the "not available yet" message only shows for agents that genuinely lack the capability.
 
 ### Phase 4 — UX and edge cases
 
-- Cancel any in-flight prompt for the session before issuing `session/truncate`
-  (`AcpThread::rewind` already cancels via the truncate path on the native side; confirm parity).
-- When a message has no `message_id` (e.g. an older session loaded via `session/load` before
-  IDs were threaded), keep the edit affordance disabled for that message rather than failing.
-- Surface `session/truncate` RPC failures to the UI as a user-visible error, not a silent drop.
+- Per the RFD, the agent cancels any active turn before rewinding; confirm Zed's path matches.
+- Keep the edit affordance disabled for any message whose `id` is `None` (e.g. older sessions
+  loaded before ids were threaded).
+- Surface `session/rewind` / `session/edit_prompt` RPC failures to the UI, not a silent drop.
 - Leave git-checkpoint behavior matching the native agent: the separate **Restore Checkpoint**
-  button (driven by `Checkpoint.show`) is unaffected by this change.
+  button (driven by `Checkpoint.show`) is unaffected (filesystem rollback is out of the
+  protocol per the RFD).
 
 ### Phase 5 — Testing
 
-- Extend the fake/test ACP agent in `crates/agent_servers/src/acp.rs` to advertise and honor
-  `session/truncate`.
+- Extend the fake/test ACP agent in `crates/agent_servers/src/acp.rs` to advertise
+  `rewindSession` and honor `session/rewind` / `session/edit_prompt`.
 - Tests for: the rewind path end to end, capability gating (button hidden when unsupported),
-  the `message_id` round-trip (sent on `PromptRequest`, echoed on `PromptResponse`), and the
-  no-`message_id` edge case.
+  the `message_id` round-trip, and the no-`message_id` edge case.
 - Per CLAUDE.md, use GPUI executor timers (`cx.background_executor().timer`) rather than
   `smol::Timer::after` in any test that drives `run_until_parked()`.
 
 ## Non-goals
 
 - The lossy "Zed-only session rebuild" (new session + replay) fallback is explicitly **not**
-  pursued; the requester chose the protocol + adapter extension.
-- No change to git-checkpoint capture/restore behavior beyond what already exists.
+  pursued.
+- Filesystem rollback in the protocol — out of scope per the RFD; Zed's git checkpoint is
+  unchanged.
 - No new UI design — this reuses the existing inline editor and Regenerate button.
 
 ## Open questions / risks
 
-- Phase 0 may reveal the adapter cannot trim its transcript cleanly (e.g. context is compacted
-  or summarized server-side); if so, the adapter work in Phase 2 grows and should be re-scoped.
-- Version coordination: Zed pins `agent-client-protocol = "=0.12.1"`; the new verb requires a
+- **Gating dependency is upstream, not technical.** RFD #1214 must be championed and accepted,
+  then implemented in the protocol crate and the adapter, before Zed's Phase 3 can compile.
+- Auto-compaction: rewinding across an SDK compaction boundary needs validation.
+- Version coordination: Zed pins `agent-client-protocol = "=0.12.1"`; the new methods require a
   coordinated release of the protocol crate, the adapter, and the registry entry.
 
 ## Key references
 
-- `crates/acp_thread/src/connection.rs` — `AgentConnection` trait, `AgentSessionTruncate` trait,
-  `UserMessageId`.
-- `crates/acp_thread/src/acp_thread.rs` — `AcpThread::rewind`, `supports_truncate`,
-  `handle_session_update`, prompt/send flow, `Checkpoint`/`restore_checkpoint`.
-- `crates/agent_servers/src/acp.rs` — `AcpConnection`, capability storage and
-  `supports_load_session` / `supports_resume_session` / `supports_close_session`, prompt flow,
-  test harness.
-- `crates/agent/src/agent.rs` — `NativeAgentConnection::truncate`, `NativeAgentSessionTruncate`
-  (the model to follow).
-- `crates/agent/src/thread.rs` — `Thread::truncate` (native, in-process reference).
-- `crates/agent_ui/src/conversation_view/thread_view.rs` — `editing_message`, `regenerate`,
-  Regenerate button, disabled tooltip.
-- `Cargo.toml` — `agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }`.
+- RFD: [`session-rewind.mdx` / PR #1214](https://github.com/agentclientprotocol/agent-client-protocol/pull/1214);
+  related [`session-fork`](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/session-fork.mdx)
+  and [`message-id`](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/message-id.mdx) RFDs.
+- Motivating Zed issues: zed#52153, zed#39997, zed#28676, zed#55888.
+- `crates/acp_thread/src/connection.rs` — `AgentConnection` trait, `AgentSessionTruncate` trait, `UserMessageId`.
+- `crates/acp_thread/src/acp_thread.rs` — `AcpThread::rewind`, `supports_truncate`, `handle_session_update`, prompt/send flow, `Checkpoint`/`restore_checkpoint`.
+- `crates/agent_servers/src/acp.rs` — `AcpConnection`, capability storage and `supports_load_session` / `supports_resume_session` / `supports_close_session`, prompt flow, test harness.
+- `crates/agent/src/agent.rs` — `NativeAgentConnection::truncate`, `NativeAgentSessionTruncate` (the model to follow); `crates/agent/src/thread.rs` — `Thread::truncate`.
+- `crates/agent_ui/src/conversation_view/thread_view.rs` — `editing_message`, `regenerate`, Regenerate button, disabled tooltip.
+- SDK: `@anthropic-ai/claude-agent-sdk@0.3.156` `resumeSessionAt` / `forkSession({upToMessageId})` / `rewindFiles`.
