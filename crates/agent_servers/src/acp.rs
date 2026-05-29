@@ -555,6 +555,42 @@ pub struct AcpSession {
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
     ref_count: usize,
+    /// Set by an experimental rewind (`AcpConnection::truncate`) to the id of
+    /// the user message to rewind to. Consumed by the next `prompt`, which
+    /// forwards it to the agent as `_meta.zed.rewindToMessageId`.
+    pending_rewind: Option<acp_thread::UserMessageId>,
+}
+
+/// Experimental rewind handle returned by `AcpConnection::truncate`. Records
+/// the target message id on the session so the next `prompt` forwards it to the
+/// agent as `_meta.zed.rewindToMessageId`.
+struct AcpSessionTruncate {
+    session_id: acp::SessionId,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+}
+
+impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
+    fn run(&self, message_id: acp_thread::UserMessageId, _cx: &mut App) -> Task<Result<()>> {
+        match self.sessions.borrow_mut().get_mut(&self.session_id) {
+            Some(session) => {
+                session.pending_rewind = Some(message_id);
+                Task::ready(Ok(()))
+            }
+            None => Task::ready(Err(anyhow!("session not found"))),
+        }
+    }
+}
+
+/// Whether the agent advertises the experimental Zed session-rewind capability
+/// via `agentCapabilities._meta.zed.rewindSession == true`.
+fn agent_supports_rewind(capabilities: &acp::AgentCapabilities) -> bool {
+    capabilities
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("zed"))
+        .and_then(|zed| zed.get("rewindSession"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 pub struct AcpSessionList {
@@ -1236,6 +1272,7 @@ impl AcpConnection {
                             models: None,
                             config_options: None,
                             ref_count: 1,
+                            pending_rewind: None,
                         },
                     );
 
@@ -1711,6 +1748,7 @@ impl AgentConnection for AcpConnection {
                     models,
                     config_options: config_options.map(ConfigOptions::new),
                     ref_count: 1,
+                    pending_rewind: None,
                 },
             );
 
@@ -1819,6 +1857,22 @@ impl AgentConnection for AcpConnection {
 
     fn supports_close_session(&self) -> bool {
         self.agent_capabilities.session_capabilities.close.is_some()
+    }
+
+    fn truncate(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
+        // Experimental: only enabled when the agent advertises the Zed rewind
+        // capability via `agentCapabilities._meta.zed.rewindSession`.
+        if !agent_supports_rewind(&self.agent_capabilities) {
+            return None;
+        }
+        Some(Rc::new(AcpSessionTruncate {
+            session_id: session_id.clone(),
+            sessions: self.sessions.clone(),
+        }))
     }
 
     fn close_session(
@@ -1958,12 +2012,35 @@ impl AgentConnection for AcpConnection {
     fn prompt(
         &self,
         _id: acp_thread::UserMessageId,
-        params: acp::PromptRequest,
+        mut params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
+
+        // Experimental rewind: if a rewind was requested for this session
+        // (edit-and-resend), forward the target message id to the agent on this
+        // prompt as `_meta.zed.rewindToMessageId` so it truncates its transcript
+        // before running the edited turn.
+        if let Some(rewind_to) = sessions
+            .borrow_mut()
+            .get_mut(&session_id)
+            .and_then(|session| session.pending_rewind.take())
+        {
+            let mut meta = params.meta.take().unwrap_or_default();
+            let zed = meta
+                .entry("zed".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(object) = zed.as_object_mut() {
+                object.insert(
+                    "rewindToMessageId".to_string(),
+                    serde_json::Value::String(rewind_to.to_string()),
+                );
+            }
+            params.meta = Some(meta);
+        }
+
         cx.foreground_executor().spawn(async move {
             let result = into_foreground_future(conn.send_request(params)).await;
 
@@ -2596,6 +2673,33 @@ mod tests {
     use super::*;
     use gpui::UpdateGlobal as _;
     use settings::Settings as _;
+
+    #[test]
+    fn test_agent_supports_rewind() {
+        let mut capabilities = acp::AgentCapabilities::default();
+        assert!(
+            !agent_supports_rewind(&capabilities),
+            "rewind must be off when no capability is advertised"
+        );
+
+        capabilities.meta = Some(acp::Meta::from_iter([(
+            "zed".to_string(),
+            serde_json::json!({ "rewindSession": true }),
+        )]));
+        assert!(
+            agent_supports_rewind(&capabilities),
+            "rewind must be on when zed.rewindSession is true"
+        );
+
+        capabilities.meta = Some(acp::Meta::from_iter([(
+            "zed".to_string(),
+            serde_json::json!({ "rewindSession": false }),
+        )]));
+        assert!(
+            !agent_supports_rewind(&capabilities),
+            "rewind must be off when zed.rewindSession is false"
+        );
+    }
 
     #[test]
     fn terminal_auth_task_builds_spawn_from_prebuilt_command() {
