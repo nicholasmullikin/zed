@@ -116,6 +116,26 @@ pub trait AgentConnection {
         )))
     }
 
+    /// Whether this agent supports forking an existing session into a new branch.
+    fn supports_fork_session(&self) -> bool {
+        false
+    }
+
+    /// Fork an existing session into a new session that shares its history up to
+    /// the current point. The original session is left untouched, and the
+    /// returned thread is a new branch the caller can continue independently.
+    fn fork_session(
+        self: Rc<Self>,
+        _session_id: acp::SessionId,
+        _up_to_message_id: Option<UserMessageId>,
+        _project: Entity<Project>,
+        _work_dirs: PathList,
+        _title: Option<SharedString>,
+        _cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Err(anyhow::Error::msg("Forking sessions is not supported")))
+    }
+
     /// Whether this agent supports showing session history.
     fn supports_session_history(&self) -> bool {
         self.supports_load_session() || self.supports_resume_session()

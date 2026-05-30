@@ -555,6 +555,42 @@ pub struct AcpSession {
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
     ref_count: usize,
+    /// Set by an experimental rewind (`AcpConnection::truncate`) to the id of
+    /// the user message to rewind to. Consumed by the next `prompt`, which
+    /// forwards it to the agent as `_meta.zed.rewindToMessageId`.
+    pending_rewind: Option<acp_thread::UserMessageId>,
+}
+
+/// Experimental rewind handle returned by `AcpConnection::truncate`. Records
+/// the target message id on the session so the next `prompt` forwards it to the
+/// agent as `_meta.zed.rewindToMessageId`.
+struct AcpSessionTruncate {
+    session_id: acp::SessionId,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+}
+
+impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
+    fn run(&self, message_id: acp_thread::UserMessageId, _cx: &mut App) -> Task<Result<()>> {
+        match self.sessions.borrow_mut().get_mut(&self.session_id) {
+            Some(session) => {
+                session.pending_rewind = Some(message_id);
+                Task::ready(Ok(()))
+            }
+            None => Task::ready(Err(anyhow!("session not found"))),
+        }
+    }
+}
+
+/// Whether the agent advertises the experimental Zed session-rewind capability
+/// via `agentCapabilities._meta.zed.rewindSession == true`.
+fn agent_supports_rewind(capabilities: &acp::AgentCapabilities) -> bool {
+    capabilities
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("zed"))
+        .and_then(|zed| zed.get("rewindSession"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 pub struct AcpSessionList {
@@ -1236,6 +1272,7 @@ impl AcpConnection {
                             models: None,
                             config_options: None,
                             ref_count: 1,
+                            pending_rewind: None,
                         },
                     );
 
@@ -1422,6 +1459,16 @@ impl SessionDirectories {
         mcp_servers: Vec<acp::McpServer>,
     ) -> acp::ResumeSessionRequest {
         acp::ResumeSessionRequest::new(session_id, self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
@@ -1711,6 +1758,7 @@ impl AgentConnection for AcpConnection {
                     models,
                     config_options: config_options.map(ConfigOptions::new),
                     ref_count: 1,
+                    pending_rewind: None,
                 },
             );
 
@@ -1817,8 +1865,83 @@ impl AgentConnection for AcpConnection {
         )
     }
 
+    fn supports_fork_session(&self) -> bool {
+        self.agent_capabilities.session_capabilities.fork.is_some()
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        up_to_message_id: Option<acp_thread::UserMessageId>,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        if !self.supports_fork_session() {
+            return Task::ready(Err(anyhow!(LoadError::Other(
+                "Forking sessions is not supported by this agent.".into()
+            ))));
+        }
+
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let mcp_servers = mcp_servers_for_project(&project, cx);
+
+        cx.spawn(async move |cx| {
+            // 1. Fork on the agent. The response carries a brand-new session id
+            //    whose transcript is a copy of the source session up to now.
+            let mut request = directories.into_fork_session_request(session_id, mcp_servers);
+            // Fork at a specific earlier message (experimental Zed extension): the
+            // adapter maps this client message id to the transcript slice point.
+            // Without it, the whole session is copied.
+            if let Some(up_to) = up_to_message_id {
+                let mut zed = serde_json::Map::new();
+                zed.insert(
+                    "upToMessageId".to_string(),
+                    serde_json::Value::String(up_to.to_string()),
+                );
+                let mut meta = request.meta.take().unwrap_or_default();
+                meta.insert("zed".to_string(), serde_json::Value::Object(zed));
+                request.meta = Some(meta);
+            }
+            let response = into_foreground_future(self.connection.send_request(request))
+                .await
+                .map_err(map_acp_error)?;
+
+            // 2. `session/fork` creates the branch but does NOT replay its
+            //    history, so loading the forked session is what populates the new
+            //    thread (via the history-replay `session/update` notifications in
+            //    `open_or_create_session`). Without this the forked thread renders
+            //    empty even though the agent retains the shared context.
+            cx.update(|cx| {
+                self.clone()
+                    .load_session(response.session_id, project, work_dirs, title, cx)
+            })
+            .await
+        })
+    }
+
     fn supports_close_session(&self) -> bool {
         self.agent_capabilities.session_capabilities.close.is_some()
+    }
+
+    fn truncate(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
+        // Experimental: only enabled when the agent advertises the Zed rewind
+        // capability via `agentCapabilities._meta.zed.rewindSession`.
+        if !agent_supports_rewind(&self.agent_capabilities) {
+            return None;
+        }
+        Some(Rc::new(AcpSessionTruncate {
+            session_id: session_id.clone(),
+            sessions: self.sessions.clone(),
+        }))
     }
 
     fn close_session(
@@ -1958,12 +2081,35 @@ impl AgentConnection for AcpConnection {
     fn prompt(
         &self,
         _id: acp_thread::UserMessageId,
-        params: acp::PromptRequest,
+        mut params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
+
+        // Experimental rewind: if a rewind was requested for this session
+        // (edit-and-resend), forward the target message id to the agent on this
+        // prompt as `_meta.zed.rewindToMessageId` so it truncates its transcript
+        // before running the edited turn.
+        if let Some(rewind_to) = sessions
+            .borrow_mut()
+            .get_mut(&session_id)
+            .and_then(|session| session.pending_rewind.take())
+        {
+            let mut meta = params.meta.take().unwrap_or_default();
+            let zed = meta
+                .entry("zed".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(object) = zed.as_object_mut() {
+                object.insert(
+                    "rewindToMessageId".to_string(),
+                    serde_json::Value::String(rewind_to.to_string()),
+                );
+            }
+            params.meta = Some(meta);
+        }
+
         cx.foreground_executor().spawn(async move {
             let result = into_foreground_future(conn.send_request(params)).await;
 
@@ -2596,6 +2742,33 @@ mod tests {
     use super::*;
     use gpui::UpdateGlobal as _;
     use settings::Settings as _;
+
+    #[test]
+    fn test_agent_supports_rewind() {
+        let mut capabilities = acp::AgentCapabilities::default();
+        assert!(
+            !agent_supports_rewind(&capabilities),
+            "rewind must be off when no capability is advertised"
+        );
+
+        capabilities.meta = Some(acp::Meta::from_iter([(
+            "zed".to_string(),
+            serde_json::json!({ "rewindSession": true }),
+        )]));
+        assert!(
+            agent_supports_rewind(&capabilities),
+            "rewind must be on when zed.rewindSession is true"
+        );
+
+        capabilities.meta = Some(acp::Meta::from_iter([(
+            "zed".to_string(),
+            serde_json::json!({ "rewindSession": false }),
+        )]));
+        assert!(
+            !agent_supports_rewind(&capabilities),
+            "rewind must be off when zed.rewindSession is false"
+        );
+    }
 
     #[test]
     fn terminal_auth_task_builds_spawn_from_prebuilt_command() {
