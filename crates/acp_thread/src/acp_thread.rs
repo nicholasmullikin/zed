@@ -1436,6 +1436,10 @@ impl AcpThread {
         self.connection.truncate(&self.session_id, cx).is_some()
     }
 
+    pub fn supports_fork(&self) -> bool {
+        self.connection.supports_fork_session()
+    }
+
     pub fn work_dirs(&self) -> Option<&PathList> {
         self.work_dirs.as_ref()
     }

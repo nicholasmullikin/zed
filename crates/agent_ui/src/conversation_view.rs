@@ -95,7 +95,8 @@ use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
-    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
+    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, ForkThread, KeepAll,
+    NewThread,
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
@@ -1996,6 +1997,97 @@ impl ConversationView {
         .detach();
     }
 
+    fn fork_active_thread(&mut self, _: &ForkThread, window: &mut Window, cx: &mut Context<Self>) {
+        self.fork_thread(None, window, cx);
+    }
+
+    /// Fork the active conversation into a new branch up to and including
+    /// `up_to_message_id`. Used by the per-message "fork from here" affordance.
+    pub fn fork_from_message(
+        &mut self,
+        up_to_message_id: acp_thread::UserMessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fork_thread(Some(up_to_message_id), window, cx);
+    }
+
+    fn fork_thread(
+        &mut self,
+        up_to_message_id: Option<acp_thread::UserMessageId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        if !connected.connection.supports_fork_session() {
+            return;
+        }
+        let Some(active) = connected.active_view() else {
+            return;
+        };
+        let source_session_id = active.read(cx).thread.read(cx).session_id().clone();
+        let work_dirs = active
+            .read(cx)
+            .thread
+            .read(cx)
+            .work_dirs()
+            .cloned()
+            .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
+        let connection = connected.connection.clone();
+
+        let fork_task = connection.fork_session(
+            source_session_id,
+            up_to_message_id,
+            self.project.clone(),
+            work_dirs,
+            None,
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            let forked_thread = match fork_task.await {
+                Ok(thread) => thread,
+                Err(err) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.handle_load_error(LoadError::Other(err.to_string().into()), window, cx);
+                    })
+                    .log_err();
+                    return;
+                }
+            };
+            this.update_in(cx, |this, window, cx| {
+                let Some(conversation) = this
+                    .as_connected()
+                    .map(|connected| connected.conversation.clone())
+                else {
+                    return;
+                };
+                let forked_session_id = forked_thread.read(cx).session_id().clone();
+                conversation.update(cx, |conversation, cx| {
+                    conversation.register_thread(forked_thread.clone(), cx);
+                });
+                let view =
+                    this.new_thread_view(forked_thread, conversation, false, None, window, cx);
+                let Some(connected) = this.as_connected_mut() else {
+                    return;
+                };
+                connected.threads.insert(forked_session_id.clone(), view.clone());
+                connected.navigate_to_thread(forked_session_id);
+                if this.focus_handle.contains_focused(window, cx) {
+                    view.read(cx)
+                        .message_editor
+                        .focus_handle(cx)
+                        .focus(window, cx);
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     fn spawn_external_agent_login(
         login: task::SpawnInTerminal,
         workspace: Entity<Workspace>,
@@ -3108,6 +3200,7 @@ impl Render for ConversationView {
 
         v_flex()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::fork_active_thread))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(match &self.server_state {

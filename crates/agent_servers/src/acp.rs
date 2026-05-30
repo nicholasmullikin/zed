@@ -1462,6 +1462,16 @@ impl SessionDirectories {
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(session_id, self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
 }
 
 fn session_directories_from_work_dirs(
@@ -1853,6 +1863,65 @@ impl AgentConnection for AcpConnection {
             },
             cx,
         )
+    }
+
+    fn supports_fork_session(&self) -> bool {
+        self.agent_capabilities.session_capabilities.fork.is_some()
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        up_to_message_id: Option<acp_thread::UserMessageId>,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        if !self.supports_fork_session() {
+            return Task::ready(Err(anyhow!(LoadError::Other(
+                "Forking sessions is not supported by this agent.".into()
+            ))));
+        }
+
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let mcp_servers = mcp_servers_for_project(&project, cx);
+
+        cx.spawn(async move |cx| {
+            // 1. Fork on the agent. The response carries a brand-new session id
+            //    whose transcript is a copy of the source session up to now.
+            let mut request = directories.into_fork_session_request(session_id, mcp_servers);
+            // Fork at a specific earlier message (experimental Zed extension): the
+            // adapter maps this client message id to the transcript slice point.
+            // Without it, the whole session is copied.
+            if let Some(up_to) = up_to_message_id {
+                let mut zed = serde_json::Map::new();
+                zed.insert(
+                    "upToMessageId".to_string(),
+                    serde_json::Value::String(up_to.to_string()),
+                );
+                let mut meta = request.meta.take().unwrap_or_default();
+                meta.insert("zed".to_string(), serde_json::Value::Object(zed));
+                request.meta = Some(meta);
+            }
+            let response = into_foreground_future(self.connection.send_request(request))
+                .await
+                .map_err(map_acp_error)?;
+
+            // 2. `session/fork` creates the branch but does NOT replay its
+            //    history, so loading the forked session is what populates the new
+            //    thread (via the history-replay `session/update` notifications in
+            //    `open_or_create_session`). Without this the forked thread renders
+            //    empty even though the agent retains the shared context.
+            cx.update(|cx| {
+                self.clone()
+                    .load_session(response.session_id, project, work_dirs, title, cx)
+            })
+            .await
+        })
     }
 
     fn supports_close_session(&self) -> bool {

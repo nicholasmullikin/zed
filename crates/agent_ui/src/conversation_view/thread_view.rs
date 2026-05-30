@@ -5151,6 +5151,9 @@ impl ThreadView {
                 let is_subagent = self.is_subagent();
                 let can_rewind = self.thread.read(cx).supports_truncate(cx);
                 let is_editable = can_rewind && message.id.is_some() && !is_subagent;
+                let supports_fork =
+                    self.thread.read(cx).supports_fork() && message.id.is_some() && !is_subagent;
+                let fork_message_id = message.id.clone();
                 let agent_name = if is_subagent {
                     "subagents".into()
                 } else {
@@ -5233,7 +5236,33 @@ impl ThreadView {
                                     .border_1()
                                     .border_color(cx.theme().colors().border)
                                     .bg(cx.theme().colors().editor_background)
-                                    .overflow_hidden();
+                                    .overflow_hidden()
+                                    .when(supports_fork, |this| {
+                                        this.child(
+                                            IconButton::new("fork-from-here", IconName::GitBranchPlus)
+                                                .icon_size(IconSize::XSmall)
+                                                .icon_color(Color::Muted)
+                                                .tooltip(Tooltip::text(
+                                                    "Fork the conversation from this message into a new branch",
+                                                ))
+                                                .on_click(cx.listener({
+                                                    let fork_message_id = fork_message_id.clone();
+                                                    move |this, _, window, cx| {
+                                                        let Some(message_id) = fork_message_id.clone()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        this.server_view
+                                                            .update(cx, |conversation, cx| {
+                                                                conversation.fork_from_message(
+                                                                    message_id, window, cx,
+                                                                );
+                                                            })
+                                                            .ok();
+                                                    }
+                                                })),
+                                        )
+                                    });
 
                                 let is_loading_contents = self.is_loading_contents;
                                 if is_editable {
@@ -5744,6 +5773,20 @@ impl ThreadView {
         }
 
         container
+            .when(thread.read(cx).supports_fork(), |this| {
+                this.child(
+                    IconButton::new("fork-thread", IconName::GitBranchPlus)
+                        .shape(ui::IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Ignored)
+                        .tooltip(Tooltip::text(
+                            "Fork Conversation (branch into a new thread)",
+                        ))
+                        .on_click(cx.listener(move |_this, _, window, cx| {
+                            window.dispatch_action(ForkThread.boxed_clone(), cx);
+                        })),
+                )
+            })
             .child(open_as_markdown)
             .child(scroll_to_recent_user_prompt)
             .child(scroll_to_top)
